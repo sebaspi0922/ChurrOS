@@ -1,0 +1,639 @@
+#!/usr/bin/env python3
+"""churros-verify: QA de una rama/SHA de ChurrOS de punta a punta.
+
+  churros-verify preflight [--allow-tcg]
+  churros-verify run SHA [--edition niri] [--base origin/main] [--allow-tcg] [--keep-vm] [--fg] [--until smoke] [--run-id ID]
+  churros-verify resume [RUN_ID] [--fg]      retoma desde la primera etapa sin terminar
+  churros-verify status [RUN_ID]             etapas, último progreso
+  churros-verify report [RUN_ID]             regenera report.md y muestra el veredicto
+  churros-verify stop [RUN_ID]               para la VM, el servidor y el pipeline
+  churros-verify diffmap SHA [--base ..]     qué pruebas tocan para ese diff
+  churros-verify cache-iso SHA ISO [--edition niri] [--arch x86_64]
+  churros-verify checks                      lista de checks profundos
+
+Sin --fg, run/resume dejan el pipeline en segundo plano (setsid) y vuelven
+enseguida: las tareas de los agentes se cortan a los 15 min, el pipeline no.
+Etapas: preflight diffmap build boot session smoke deep report."""
+import argparse, contextlib, fcntl, fnmatch, glob, hashlib, json, os, re, shutil, subprocess, sys, time
+
+QA = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(QA, "lib")); sys.path.insert(0, QA)
+import qalib  # noqa: E402
+import diffmap as dm  # noqa: E402
+
+ME = os.path.abspath(__file__)
+TRANSIENT = [r"Could not resolve host", r"Temporary failure in name resolution", r"Resolving timed out",
+             r"failed retrieving file", r"download library error", r"Operation too slow",
+             r"Connection (timed out|reset|refused)", r"failed to synchronize all databases",
+             r"curl: \((6|7|18|28|35|56)\)", r"failed to retrieve some files", r"TLS handshake",
+             r"returned error: (429|5\d\d)", r"fatal: unable to access", r"keyserver receive failed",
+             r"Network is unreachable", r"error: failed to download"]
+STALE_DB = [r"error: target not found", r"returned error: 404", r"database file for .* does not exist",
+            r"could not open file .*\.db"]
+
+
+def sh(cmd, **kw):
+    return subprocess.run(cmd, shell=isinstance(cmd, str), capture_output=True, text=True, **kw)
+
+
+def iso_cache_path(sha, edition, arch):
+    return os.path.join(qalib.CACHE, "iso", f"ChurrOS-{sha[:12]}-{edition}-{arch}.iso")
+
+
+# ------------------------------------------------------------------ preflight
+def kvm_usable():
+    """/dev/kvm usable de verdad: además de abrirlo, arranca una QEMU mínima con
+    KVM y le pide `query-status` por QMP (el bucle principal solo responde si se
+    crearon los vCPU). En este box /dev/kvm existe y KVM_CREATE_VM funciona,
+    pero la creación del vCPU se cuelga; por eso la prueba es con QEMU real.
+    El resultado se guarda por arranque del host (boot_id) para no repetirla."""
+    if not os.path.exists("/dev/kvm"):
+        return False, "/dev/kvm no existe"
+    if not os.access("/dev/kvm", os.R_OK | os.W_OK):
+        return False, "/dev/kvm sin permiso de lectura/escritura"
+    boot_id = open("/proc/sys/kernel/random/boot_id").read().strip()
+    cache = os.path.join(qalib.CACHE, "kvm-probe.json")
+    try:
+        c = json.load(open(cache))
+        if c.get("boot_id") == boot_id and not os.environ.get("QA_KVM_REPROBE"):
+            return c["ok"], c["msg"] + " (en caché para este arranque del host)"
+    except Exception:
+        pass
+    sock = f"/tmp/churros-verify-kvmprobe-{os.getpid()}.sock"
+    p = subprocess.Popen(["qemu-system-x86_64", "-M", "q35,accel=kvm", "-cpu", "host", "-m", "128",
+                          "-display", "none", "-nodefaults", "-S", "-qmp", f"unix:{sock},server=on,wait=off"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    ok, msg = False, "QEMU con KVM no respondió a query-status en 15 s (vCPU colgado)"
+    t0 = time.time()
+    while time.time() - t0 < 15 and p.poll() is None:
+        try:
+            import socket
+            s = socket.socket(socket.AF_UNIX); s.settimeout(3); s.connect(sock)
+            f = s.makefile("rb"); f.readline()
+            s.sendall(b'{"execute":"qmp_capabilities"}\n'); f.readline()
+            s.sendall(b'{"execute":"query-status"}\n')
+            r = f.readline()
+            if b"return" in r:
+                ok, msg = True, "QEMU+KVM responde (vCPU creado)"
+            s.close()
+            break
+        except (OSError, socket.timeout):
+            time.sleep(0.5)
+    if p.poll() is not None and not ok:
+        msg = "QEMU con KVM salió: " + p.stderr.read().decode(errors="replace").strip()[-200:]
+    p.kill()
+    with contextlib.suppress(Exception):
+        p.wait(timeout=10)
+    with contextlib.suppress(Exception):
+        os.remove(sock)
+    os.makedirs(qalib.CACHE, exist_ok=True)
+    json.dump({"boot_id": boot_id, "ok": ok, "msg": msg, "when": qalib.now()}, open(cache, "w"))
+    return ok, msg
+
+
+def gpu_3d_usable():
+    """3D del host, aparte de KVM. ./churros run elige virtio-vga-gl si existe
+    /dev/dri. Sin eso Niri no pinta en la TTY y el smoke lo anida en cage.
+    KVM no implica 3D: un runner con /dev/kvm y sin GPU sigue usando cage."""
+    if os.environ.get("QA_FORCE_NO3D") == "1":
+        return False, "QA_FORCE_NO3D=1"
+    if os.path.isdir("/dev/dri"):
+        nodes = sorted(os.listdir("/dev/dri"))
+        detail = "/dev/dri presente" + (f" ({', '.join(nodes)})" if nodes else "")
+        return True, detail
+    return False, "/dev/dri no existe"
+
+
+def preflight(allow_tcg):
+    notes, fatal = [], []
+    kvm_ok, kvm_msg = kvm_usable()
+    d3_ok, d3_msg = gpu_3d_usable()
+    notes.append(("kvm", kvm_ok, kvm_msg))
+    notes.append(("3d", d3_ok, d3_msg))
+    if not kvm_ok and not allow_tcg:
+        fatal.append(f"sin KVM ({kvm_msg}); usa --allow-tcg para seguir con emulación (lento, ~12 min hasta el login)")
+    for tool in ("qemu-system-x86_64", "qemu-img", "git", "convert", "curl"):
+        p = shutil.which(tool)
+        notes.append((tool, bool(p), p or "falta"))
+        if not p:
+            fatal.append(f"falta {tool}")
+    ovmf = any(os.path.exists(p) for p in ("/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+                                           "/usr/share/OVMF/OVMF_CODE.fd"))
+    notes.append(("ovmf", ovmf, "ok" if ovmf else "falta"))
+    if not ovmf:
+        fatal.append("falta OVMF")
+    os.makedirs(qalib.CACHE, exist_ok=True)
+    free = shutil.disk_usage(qalib.CACHE).free / 2**30
+    notes.append(("disco", free > 15, f"{free:.0f} GiB libres en {qalib.CACHE}"))
+    if free < 15:
+        fatal.append("menos de 15 GiB libres")
+    others = sh("pgrep -a qemu-system").stdout.strip()
+    notes.append(("otras VMs", not others, others.replace("\n", " ; ")[:200] or "ninguna"))
+    return (not fatal), notes, fatal, kvm_ok, d3_ok
+
+
+# --------------------------------------------------------------------- etapas
+def stage_preflight(rid, st):
+    ok, notes, fatal, kvm, has_3d = preflight(st["allow_tcg"])
+    for n, good, msg in notes:
+        qalib.log(rid, f"preflight {n}: {'ok' if good else 'NO'} - {msg}")
+    qalib.update_state(rid, lambda s: s.update({"accel": "kvm" if kvm else "tcg", "has_3d": has_3d}))
+    if not kvm and st["allow_tcg"]:
+        qalib.warn(rid, "sin KVM: la VM corrió con TCG (--allow-tcg); tiempos no representativos")
+    if not has_3d:
+        qalib.log(rid, "sin 3D: Niri del smoke se anida en cage (KVM no implica 3D)")
+    if notes[-1][1] is False:
+        qalib.log(rid, "nota: hay otras VMs corriendo (no bloquea): " + notes[-1][2])
+    if not ok:
+        qalib.add_result(rid, "meta", "preflight", "Preflight", "FAIL", "; ".join(fatal))
+        raise StageFail("; ".join(fatal))
+    qalib.add_result(rid, "meta", "preflight", "Preflight", "PASS", notes[0][2])
+
+
+def stage_diffmap(rid, st):
+    d = dm.compute(st["sha"], st["base"], st["edition"])
+    json.dump(d, open(os.path.join(qalib.run_dir(rid), "diffmap.json"), "w"), indent=2, ensure_ascii=False)
+    qalib.log(rid, f"diffmap: {len(d['files'])} archivos, features={[f['id'] for f in d['features']]}, "
+                   f"unmapped={len(d['unmapped'])}, docs_only={d['docs_only']}")
+
+
+class StageFail(Exception):
+    pass
+
+
+def ensure_src(sha):
+    src = os.path.join(qalib.CACHE, "src", sha[:12])
+    if not os.path.isdir(src):
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        r = sh(["git", "-C", qalib.REPO, "worktree", "add", "--detach", src, sha])
+        if r.returncode:
+            raise StageFail("git worktree add: " + r.stderr)
+    return src
+
+
+def classify(log_text):
+    tail = "\n".join(log_text.splitlines()[-400:])
+    for rx in STALE_DB:
+        if re.search(rx, tail):
+            return "stale_db", rx
+    for rx in TRANSIENT:
+        if re.search(rx, tail):
+            return "transient", rx
+    return "fatal", None
+
+
+def stage_build(rid, st):
+    rd = qalib.run_dir(rid); sha = st["sha"]
+    d = json.load(open(os.path.join(rd, "diffmap.json")))
+    src = ensure_src(sha)
+    # ./churros check (estático, rápido) antes del build
+    if "check" not in qalib.done_ids(rid, "build"):
+        t0 = time.time()
+        r = sh(f"cd {src} && ./churros check > {rd}/logs/check.log 2>&1; echo $?")
+        rc = int(r.stdout.strip() or 1)
+        fails = sh(f"grep -E '✗|FAIL|Error' {rd}/logs/check.log | head -5").stdout.strip()
+        qalib.add_result(rid, "build", "check", "./churros check", "PASS" if rc == 0 else "FAIL",
+                         f"rc={rc}" + (f"; {fails}" if fails else ""), ["logs/check.log"], time.time() - t0)
+    cache = iso_cache_path(sha, st["edition"], st["arch"])
+    if os.path.exists(cache) and not st.get("rebuild"):
+        meta = cache + ".json"
+        src_note = json.load(open(meta)).get("source", "build") if os.path.exists(meta) else "caché"
+        qalib.update_state(rid, lambda s: s.update({"iso": cache, "iso_source": f"caché ({src_note})"}))
+        qalib.add_result(rid, "build", "iso", "ISO", "PASS", f"reutilizada de la caché por SHA: {cache} ({src_note})")
+        return
+    if d["docs_only"]:
+        base_iso = iso_cache_path(d["merge_base"], st["edition"], st["arch"])
+        if os.path.exists(base_iso):
+            qalib.update_state(rid, lambda s: s.update({"iso": base_iso, "iso_source": "ISO de la base (diff solo docs)"}))
+            qalib.add_result(rid, "build", "iso", "ISO", "SKIP", "diff solo docs: build saltado, se usa la ISO de la base")
+        else:
+            qalib.update_state(rid, lambda s: s.update({"iso": None, "skip_vm": True}))
+            qalib.add_result(rid, "build", "iso", "ISO", "SKIP", "diff solo docs: build y VM saltados")
+        return
+    lock = open(os.path.join(qalib.CACHE, "build.lock"), "a+")
+    qalib.log(rid, "esperando el candado de build (un build a la vez en esta máquina)")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    retries = int(os.environ.get("QA_BUILD_RETRIES", 3))
+    env = dict(os.environ)
+    env.setdefault("CHURROS_CONTAINER_ARGS", "--network=host")
+    for attempt in range(1, retries + 1):
+        for old in glob.glob(os.path.join(src, "out", "*.iso")):
+            os.remove(old)
+        blog = os.path.join(rd, "logs", f"build-{attempt}.log")
+        qalib.log(rid, f"build intento {attempt}/{retries} -> logs/build-{attempt}.log")
+        t0 = time.time()
+        with open(blog, "w") as f:
+            rc = subprocess.run(["./churros", "build", "--container", "--edition", st["edition"], "--arch", st["arch"]],
+                                cwd=src, stdout=f, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env).returncode
+        isos = glob.glob(os.path.join(src, "out", "*.iso"))
+        if rc == 0 and isos:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            shutil.move(isos[0], cache)
+            json.dump({"sha": sha, "source": f"build {rid}", "built": qalib.now(),
+                       "sha256": sha256(cache)}, open(cache + ".json", "w"), indent=2)
+            qalib.update_state(rid, lambda s: s.update({"iso": cache, "iso_source": "build"}))
+            qalib.add_result(rid, "build", "iso", "ISO", "PASS", f"intento {attempt}, {time.time() - t0:.0f}s -> {cache}",
+                             [f"logs/build-{attempt}.log"], time.time() - t0)
+            return
+        kind, rx = classify(open(blog, errors="replace").read())
+        qalib.log(rid, f"build rc={rc}: {kind} ({rx})")
+        if kind == "fatal" or attempt == retries:
+            qalib.add_result(rid, "build", "iso", "ISO", "FAIL", f"rc={rc} {kind} {rx or ''} (intento {attempt})",
+                             [f"logs/build-{attempt}.log"], time.time() - t0)
+            raise StageFail(f"build falló ({kind})")
+        if kind == "stale_db":
+            # DB vieja: pacman -Sy en el host si es Arch; en contenedor, imagen nueva
+            # (el entrypoint ya hace pacman -Sy al arrancar).
+            if shutil.which("pacman"):
+                sh("sudo -n pacman -Sy --noconfirm")
+            env["CHURROS_CONTAINER_REBUILD"] = "1"
+            qalib.warn(rid, f"build: DB de paquetes vieja ({rx}); pacman -Sy / imagen del contenedor regenerada y reintento")
+        else:
+            time.sleep(30 * attempt)
+
+
+def sha256(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def stage_boot(rid, st):
+    if st.get("skip_vm"):
+        return "skipped"
+    if st.get("wait_other_vms") and not (st.get("qemu_pid") and qalib.pid_alive(st["qemu_pid"])):
+        t0 = time.time()
+        while sh(["pgrep", "^qemu-system"]).stdout.strip():
+            if time.time() - t0 > 6 * 3600:
+                raise StageFail("otra VM de QEMU sigue corriendo tras 6 h")
+            qalib.log(rid, "esperando a que termine otra VM de QEMU (--wait-other-vms)") if int(time.time() - t0) % 600 < 30 else None
+            time.sleep(30)
+        if time.time() - t0 > 5:
+            qalib.log(rid, f"otras VMs terminadas tras {time.time() - t0:.0f}s de espera")
+    r = subprocess.run([sys.executable, os.path.join(QA, "vm-up"), rid])
+    if r.returncode:
+        raise StageFail("vm-up falló")
+    st = qalib.load_state(rid)
+    tmo = 900 if st["accel"] == "kvm" else 2400
+    t0 = time.time()
+    ok, m = qalib.wait_until(rid, serial=r"login:", timeout=tmo, interval=3, since=0)
+    if not ok:
+        raise StageFail(f"sin prompt de login en la consola serie tras {tmo}s")
+    qalib.update_state(rid, lambda s: s.__setitem__("boot_seconds", round(time.time() - t0)))
+
+
+def serial_quiet(rid, secs=3, timeout=60):
+    t0 = time.time(); last = -1; since = time.time()
+    while time.time() - t0 < timeout:
+        n = qalib.serial_size(rid)
+        if n != last:
+            last, since = n, time.time()
+        elif time.time() - since >= secs:
+            return
+        time.sleep(0.5)
+
+
+def _probe_shell(rid, timeout=12):
+    off = qalib.serial_size(rid)
+    qalib.serial_send(rid, "echo QA_SH_$((40+1))\r")
+    ok, m = qalib.wait_until(rid, serial=r"QA_SH_41|Password:", timeout=timeout, since=off)
+    if ok and "Password" in m:  # el eco cayó como usuario: abortar ese login
+        qalib.serial_send(rid, "\r")
+        qalib.wait_until(rid, serial=r"login: *$", timeout=40, since=off)
+        return False
+    return ok
+
+
+def serial_shell(rid, user="churros"):
+    """Shell en ttyS0 como el usuario live (sin contraseña; root no puede entrar
+    por serie, pero el usuario live tiene sudo sin contraseña). Notas de la
+    consola: agetty manda consultas a la terminal al arrancar y puede comerse
+    la primera línea; zsh tarda en pintar el prompt con TCG. Por eso todo se
+    confirma con un eco y se reintenta."""
+    if _probe_shell(rid):
+        return True
+    for _ in range(6):
+        serial_quiet(rid)
+        off = qalib.serial_size(rid)
+        qalib.serial_send(rid, user + "\r")
+        ok, m = qalib.wait_until(rid, serial=r"Password:|Last login|\u276f|\$ *$|# *$", timeout=25, since=off)
+        if ok and "Password" in m:
+            qalib.serial_send(rid, "\r")
+        serial_quiet(rid, secs=3, timeout=40)
+        if _probe_shell(rid, timeout=20):
+            return True
+    return False
+
+
+def stage_session(rid, st):
+    if st.get("skip_vm"):
+        return "skipped"
+    subprocess.run([sys.executable, os.path.join(QA, "vm-up"), rid], check=True)  # idempotente
+    st = qalib.load_state(rid)
+    if not qalib.agent_alive(rid):
+        port = st["http_port"]
+        H = f"http://10.0.2.2:{port}"
+        for attempt in range(4):
+            if not serial_shell(rid):
+                qalib.log(rid, f"login por serie sin shell (intento {attempt + 1})")
+                continue
+            off = qalib.serial_size(rid)
+            qalib.serial_send(rid, f"sudo -n sh -c 'curl -sf -m 20 --retry 40 --retry-delay 2 --retry-all-errors {H}/f/agent.sh -o /run/qa-agent.sh "
+                                   f"&& (setsid bash /run/qa-agent.sh {H} >/dev/null 2>&1 < /dev/null &)' ; "
+                                   f"echo QA_BOOT_$((6*7))\r")
+            qalib.wait_until(rid, serial=r"QA_BOOT_42", timeout=150, since=off)
+            for _ in range(60):
+                if qalib.agent_alive(rid):
+                    break
+                time.sleep(1)
+            if qalib.agent_alive(rid):
+                break
+            qalib.log(rid, f"agente no responde (intento {attempt + 1})")
+        else:
+            raise StageFail("no se pudo arrancar el agente del invitado por la consola serie")
+        # el host para que el invitado suba evidencia
+        qalib.guest_cmd(rid, f"mkdir -p /run/qa && echo {H} > /run/qa/host && chmod 644 /run/qa/host", timeout=20)
+    rc, out = qalib.guest_cmd(rid, "uname -r; cat /etc/os-release | grep ^PRETTY; ip -4 -br a | grep -v lo", timeout=30)
+    qalib.log(rid, "agente listo: " + out.strip().replace("\n", " | "))
+
+
+def stage_smoke(rid, st):
+    if st.get("skip_vm"):
+        return "skipped"
+    from checks import smoke
+    smoke.run(rid)
+
+
+def stage_deep(rid, st):
+    if st.get("skip_vm"):
+        return "skipped"
+    from checks import deep, smoke
+    d = json.load(open(os.path.join(qalib.run_dir(rid), "diffmap.json")))
+    deep.run(rid, d)
+    smoke.journal(rid)  # punto 12 del smoke: al final, con todo lo que pasó
+
+
+def stage_report(rid, st):
+    write_report(rid)
+    if not st.get("keep_vm"):
+        subprocess.run([sys.executable, os.path.join(QA, "vm-up"), rid, "--down"])
+
+
+STAGE_FN = {"preflight": stage_preflight, "diffmap": stage_diffmap, "build": stage_build, "boot": stage_boot,
+            "session": stage_session, "smoke": stage_smoke, "deep": stage_deep, "report": stage_report}
+
+
+def pipeline(rid):
+    rd = qalib.run_dir(rid)
+    lockf = open(os.path.join(rd, "pipeline.lock"), "a+")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("ya hay un pipeline corriendo para esta corrida"); return 3
+    qalib.update_state(rid, lambda s: s.update({"pipeline_pid": os.getpid()}))
+    for stage in qalib.STAGES:
+        st = qalib.load_state(rid)
+        if st["stages"].get(stage, {}).get("status") in ("done", "skipped"):
+            continue
+        until = st.get("until") or None
+        past = bool(until) and stage != "report" and qalib.STAGES.index(stage) > qalib.STAGES.index(until)
+        qalib.set_stage(rid, stage, "running")
+        qalib.log(rid, f"== etapa {stage}")
+        t0 = time.time()
+        try:
+            if past:
+                # El punto 12 del smoke vive al final de deep. Con --until smoke
+                # se toma igual y el resto de deep no corre.
+                if stage == "deep" and until == "smoke" and not st.get("skip_vm"):
+                    qalib.log(rid, "journal del smoke (punto 12); deep no corre (--until smoke)")
+                    from checks import smoke as smoke_mod
+                    smoke_mod.journal(rid)
+                qalib.set_stage(rid, stage, "skipped", seconds=round(time.time() - t0))
+                continue
+            res = STAGE_FN[stage](rid, st)
+            qalib.set_stage(rid, stage, "skipped" if res == "skipped" else "done", seconds=round(time.time() - t0))
+        except StageFail as e:
+            qalib.set_stage(rid, stage, "failed", error=str(e), seconds=round(time.time() - t0))
+            qalib.log(rid, f"etapa {stage} FALLÓ: {e}")
+            write_report(rid)
+            return 1
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            qalib.set_stage(rid, stage, "failed", error=repr(e), seconds=round(time.time() - t0))
+            write_report(rid)
+            return 1
+    qalib.log(rid, "pipeline terminado: " + verdict(rid)[0])
+    return 0
+
+
+# --------------------------------------------------------------------- informe
+def verdict(rid):
+    st = qalib.load_state(rid)
+    rows = qalib.load_results(rid)
+    d = {}
+    p = os.path.join(qalib.run_dir(rid), "diffmap.json")
+    if os.path.exists(p):
+        d = json.load(open(p))
+    reasons = []
+    failed = [s for s, v in st["stages"].items() if v.get("status") == "failed"]
+    fails = [r for r in rows if r["status"] == "FAIL"]
+    if fails:
+        reasons += [f"FAIL {r['phase']}/{r['id']}" for r in fails]
+    if failed:
+        reasons += [f"etapa {s} falló: {st['stages'][s].get('error', '')[:120]}" for s in failed]
+    if fails or failed:
+        return "RECHAZADO", reasons
+    pending = [s for s in qalib.STAGES[:-1] if st["stages"].get(s, {}).get("status") not in ("done", "skipped")]
+    if pending:
+        return "EN CURSO", [f"etapas pendientes: {', '.join(pending)}"]
+    notes = [f"{r['status']} {r['phase']}/{r['id']}" for r in rows if r["status"] in ("WARN", "SKIP")]
+    notes += [f"UNMAPPED {f}" for f in d.get("unmapped", [])]
+    notes += [f"aviso: {w}" for w in st.get("warnings", [])]
+    if notes:
+        return "NOTAS", notes
+    return "APROBADO", []
+
+
+def fmt_dur(sec):
+    return "-" if sec is None else (f"{sec // 60}m{sec % 60:02d}s" if sec >= 60 else f"{sec}s")
+
+
+def write_report(rid):
+    rd = qalib.run_dir(rid); st = qalib.load_state(rid); rows = qalib.load_results(rid)
+    d = json.load(open(os.path.join(rd, "diffmap.json"))) if os.path.exists(os.path.join(rd, "diffmap.json")) else {}
+    v, reasons = verdict(rid)
+    ev = lambda r: ", ".join(f"[{os.path.basename(e)}]({e})" for e in r.get("evidence", []))  # noqa: E731
+    esc = lambda s: str(s).replace("|", "\\|").replace("\n", " ")  # noqa: E731
+    L = [f"# churros-verify · {rid}", "",
+         f"**Veredicto: {v}**", ""]
+    L += [f"- {x}" for x in reasons[:30]] + ([""] if reasons else [])
+    L += ["| Campo | Valor |", "|---|---|",
+          f"| SHA | `{st['sha']}` ({st.get('ref', '')}) |",
+          f"| Base | `{st['base']}` (merge-base `{d.get('merge_base', '')[:10]}`) |",
+          f"| Edición / arch | {st['edition']} / {st['arch']} |",
+          f"| Aceleración | {st.get('accel', '?')}{' (⚠ TCG, --allow-tcg)' if st.get('accel') == 'tcg' else ''} |",
+          f"| 3D | {'sí' if st.get('has_3d') else 'no (Niri anidado en cage)'} |",
+          f"| Hasta | {st.get('until') or 'report'} |",
+          f"| ISO | `{st.get('iso')}` — {st.get('iso_source', '')} |",
+          f"| Arranque hasta login | {fmt_dur(st.get('boot_seconds'))} |",
+          f"| Inicio | {st['created']} |", ""]
+    L += ["## Etapas", "", "| Etapa | Estado | Duración |", "|---|---|---|"]
+    for s in qalib.STAGES:
+        x = st["stages"].get(s, {})
+        L.append(f"| {s} | {x.get('status', 'pendiente')}{(' — ' + esc(x['error'])[:120]) if x.get('error') else ''} | {fmt_dur(x.get('seconds'))} |")
+    from checks.smoke import SMOKE
+    by = {(r["phase"], r["id"]): r for r in rows}
+    L += ["", "## Smoke (12 puntos)", "", "| # | Punto | Estado | Detalle | Evidencia |", "|---|---|---|---|---|"]
+    for cid, title in SMOKE:
+        r = by.get(("smoke", cid))
+        L.append(f"| {cid[:2]} | {title} | {r['status'] if r else '—'} | {esc(r['detail'])[:220] if r else ''} | {ev(r) if r else ''} |")
+    L += ["", "## Pruebas del diff (qa-diffmap)", ""]
+    if d:
+        L += [f"Archivos cambiados: {len(d['files'])} · features: {', '.join(f['id'] for f in d['features']) or '—'}"
+              f" · docs: {len(d['docs_files'])}{' (solo docs)' if d['docs_only'] else ''}", ""]
+    L += ["| Check | Estado | Detalle | Evidencia |", "|---|---|---|---|"]
+    for r in [r for r in rows if r["phase"] == "deep"]:
+        L.append(f"| {r['id']} | {r['status']} | {esc(r['detail'])[:260]} | {ev(r)} |")
+    L += ["", "### UNMAPPED", ""]
+    L += [f"- `{f}`" for f in d.get("unmapped", [])] or ["- (ninguno)"]
+    L += ["", "## Build", ""]
+    for r in [r for r in rows if r["phase"] in ("build", "meta")]:
+        L.append(f"- **{r['id']}**: {r['status']} — {esc(r['detail'])[:300]} {ev(r)}")
+    if st.get("warnings"):
+        L += ["", "## Avisos", ""] + [f"- {w}" for w in st["warnings"]]
+    L += ["", "## Logs", "", "- `progress.log`, `results.jsonl`, `state.json`, `diffmap.json`",
+          "- `vm/serial.log` (consola serie), `agent/jobs.log` (comandos en el invitado), `logs/` (check, build, qemu)",
+          "- `evidence/` (journal, noctalia.log, niri-nested.log), `shots/` (capturas QMP)", ""]
+    open(os.path.join(rd, "report.md"), "w").write("\n".join(L))
+    return v
+
+
+# ------------------------------------------------------------------------ CLI
+def new_run(a):
+    sha = sh(["git", "-C", qalib.REPO, "rev-parse", "--verify", a.sha + "^{commit}"])
+    if sha.returncode:
+        raise SystemExit(f"no encuentro {a.sha} en {qalib.REPO} (haz git fetch antes)")
+    sha = sha.stdout.strip()
+    rid = a.run_id or time.strftime("%Y%m%d-%H%M%S") + f"-{sha[:7]}-{a.edition}"
+    rd = qalib.run_dir(rid)
+    for sub in ("vm", "logs", "shots", "evidence", "agent"):
+        os.makedirs(os.path.join(rd, sub), exist_ok=True)
+    if not os.path.exists(os.path.join(rd, "state.json")):
+        qalib.save_state(rid, {"run_id": rid, "sha": sha, "ref": a.sha, "base": a.base, "edition": a.edition,
+                               "arch": a.arch, "allow_tcg": a.allow_tcg, "wait_other_vms": a.wait_other_vms, "keep_vm": a.keep_vm, "rebuild": a.rebuild,
+                               "until": a.until or None,
+                               "created": qalib.now(), "warnings": [], "stages": {s: {"status": "pending"} for s in qalib.STAGES}})
+    latest = os.path.join(qalib.RUNS, "latest")
+    if os.path.islink(latest) or os.path.exists(latest):
+        os.remove(latest)
+    os.symlink(rid, latest)
+    return rid
+
+
+def launch(rid, fg):
+    if fg:
+        return pipeline(rid)
+    log = open(os.path.join(qalib.run_dir(rid), "pipeline.log"), "a")
+    p = subprocess.Popen([sys.executable, ME, "resume", rid, "--fg"], stdout=log, stderr=log,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    print(f"RUN_ID={rid}\npipeline en segundo plano (pid {p.pid})\n"
+          f"  progreso: tail -f {qalib.run_dir(rid)}/progress.log\n"
+          f"  estado:   {ME} status {rid}\n  retomar:  {ME} resume {rid}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="churros-verify", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("preflight"); p.add_argument("--allow-tcg", action="store_true")
+    p = sub.add_parser("run")
+    p.add_argument("sha"); p.add_argument("--edition", default="niri"); p.add_argument("--arch", default="x86_64")
+    p.add_argument("--base", default=os.environ.get("QA_BASE", "origin/main"))
+    p.add_argument("--allow-tcg", action="store_true"); p.add_argument("--keep-vm", action="store_true")
+    p.add_argument("--until", choices=qalib.STAGES, default="",
+                   help="termina al acabar esta etapa; con smoke incluye el journal (punto 12) y salta deep")
+    p.add_argument("--rebuild", action="store_true"); p.add_argument("--fg", action="store_true")
+    p.add_argument("--wait-other-vms", action="store_true", help="antes de arrancar la VM, espera a que no haya otra QEMU")
+    p.add_argument("--run-id")
+    for name in ("resume", "status", "report", "stop"):
+        p = sub.add_parser(name); p.add_argument("run_id", nargs="?")
+        if name == "resume":
+            p.add_argument("--fg", action="store_true"); p.add_argument("--from", dest="from_stage")
+            p.add_argument("--redo", help="repite puntos concretos: smoke:09-lock,deep:wallpaper-apply-noctalia")
+    p = sub.add_parser("diffmap"); p.add_argument("sha"); p.add_argument("--base", default="origin/main")
+    p.add_argument("--edition", default="niri")
+    p = sub.add_parser("cache-iso"); p.add_argument("sha"); p.add_argument("iso")
+    p.add_argument("--edition", default="niri"); p.add_argument("--arch", default="x86_64")
+    sub.add_parser("checks")
+    a = ap.parse_args()
+
+    if a.cmd == "preflight":
+        ok, notes, fatal, _kvm, _has_3d = preflight(a.allow_tcg)
+        for n, good, msg in notes:
+            print(f"{'ok ' if good else 'NO '} {n}: {msg}")
+        print("PREFLIGHT " + ("OK" if ok else "FALLA: " + "; ".join(fatal)))
+        return 0 if ok else 2
+    if a.cmd == "run":
+        return launch(new_run(a), a.fg)
+    if a.cmd == "diffmap":
+        return subprocess.call([sys.executable, os.path.join(QA, "lib", "diffmap.py"), a.sha, "--base", a.base, "--edition", a.edition])
+    if a.cmd == "checks":
+        from checks.deep import CHECKS
+        for k, (t, _) in CHECKS.items():
+            print(f"{k:28} {t}")
+        return 0
+    if a.cmd == "cache-iso":
+        sha = sh(["git", "-C", qalib.REPO, "rev-parse", a.sha + "^{commit}"]).stdout.strip()
+        dst = iso_cache_path(sha, a.edition, a.arch)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        subprocess.run(["cp", "--reflink=auto", a.iso, dst], check=True)
+        json.dump({"sha": sha, "source": f"importada de {a.iso}", "imported": qalib.now(), "sha256": sha256(dst)},
+                  open(dst + ".json", "w"), indent=2)
+        print(dst); return 0
+    rid = qalib.resolve_run(a.run_id)
+    if a.cmd == "resume":
+        if a.redo:
+            for item in a.redo.split(","):
+                phase, _, cid = item.partition(":")
+                qalib.add_result(rid, phase, cid, cid, "REDO", "se repite a pedido (--redo)")
+                stage = "smoke" if phase == "smoke" else "deep"
+                qalib.update_state(rid, lambda s: s["stages"].__setitem__(stage, {"status": "pending"}))
+                qalib.update_state(rid, lambda s: s["stages"].__setitem__("report", {"status": "pending"}))
+        if a.from_stage:
+            def reset(s):
+                hit = False
+                for x in qalib.STAGES:
+                    hit = hit or x == a.from_stage
+                    if hit:
+                        s["stages"][x] = {"status": "pending"}
+            qalib.update_state(rid, reset)
+        else:  # una etapa "running" de un pipeline muerto se vuelve a correr
+            qalib.update_state(rid, lambda s: [v.update({"status": "pending"}) for v in s["stages"].values() if v.get("status") in ("running", "failed")])
+        return launch(rid, a.fg)
+    if a.cmd == "status":
+        st = qalib.load_state(rid)
+        print(f"RUN_ID={rid} sha={st['sha'][:10]} accel={st.get('accel')} pipeline_pid={st.get('pipeline_pid')} "
+              f"(vivo={qalib.pid_alive(st.get('pipeline_pid') or 0)}) qemu_pid={st.get('qemu_pid')}")
+        for s in qalib.STAGES:
+            x = st["stages"].get(s, {})
+            print(f"  {s:10} {x.get('status', '?'):8} {fmt_dur(x.get('seconds'))} {x.get('error', '')[:100]}")
+        print("veredicto:", verdict(rid)[0])
+        print(sh(f"tail -5 {qalib.run_dir(rid)}/progress.log").stdout)
+        return 0
+    if a.cmd == "report":
+        v = write_report(rid)
+        print(f"{qalib.run_dir(rid)}/report.md\nVEREDICTO: {v}")
+        return 0
+    if a.cmd == "stop":
+        st = qalib.load_state(rid)
+        if st.get("pipeline_pid") and qalib.pid_alive(st["pipeline_pid"]):
+            qalib.kill_pid(st["pipeline_pid"])
+        subprocess.run([sys.executable, os.path.join(QA, "vm-up"), rid, "--down"])
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

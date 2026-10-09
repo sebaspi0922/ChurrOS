@@ -206,8 +206,25 @@ Mejoras previstas:
 |----------|-------------|----------|
 | `ci.yml` | `ubuntu-latest` | `./churros check` y `cargo test -p churros-services` (rápido, sin GTK) |
 | `rust.yml` | imagen del `Containerfile`: `archlinux:latest` en `ubuntu-latest` y `menci/archlinuxarm` en `ubuntu-24.04-arm` | Compila el workspace completo (`--all-targets`), ejecuta sus tests y pasa clippy, en x86_64 y en ARM64 |
-| `iso-arm64.yml` | `ubuntu-24.04-arm`, contenedor `Containerfile.aarch64` | `./churros build --container --arch arm64` y sube la ISO como artefacto. Manual (`workflow_dispatch`) y en PRs que tocan el perfil arm64. No es un check obligatorio |
+| `iso-x86_64.yml` | `ubuntu-24.04`, contenedor `Containerfile` | `./churros build --container` y sube la ISO. Manual y cada noche en `main`. No es un check obligatorio |
+| `iso-arm64.yml` | `ubuntu-24.04-arm`, contenedor `Containerfile.aarch64` (nativo) | `./churros build --container --arch arm64`, comprueba con `file` que los binarios son aarch64 y sube la ISO. Manual y cada noche en `main`. No es un check obligatorio |
 
 Las apps GTK no se compilan en `ubuntu-latest`: gtk4-rs 0.11 exige GTK ≥ 4.22 y libadwaita-rs 0.9 exige libadwaita ≥ 1.9, versiones que Ubuntu no alcanza. `rust.yml` corre dentro de una imagen Arch, que es el mismo entorno donde se construye la ISO x86_64.
 
 ARM64 de las apps se compila en un runner arm64 nativo con Arch Linux ARM, no con `cargo check --target aarch64-unknown-linux-gnu` desde x86_64: glib-sys y gtk4-sys buscan con pkg-config las bibliotecas de aarch64, que el runner x86_64 no tiene. Esa imagen de `rust.yml` no instala archiso (Arch Linux ARM no lo empaqueta). La ISO aarch64 es otro contenedor, `Containerfile.aarch64`: instala el `archiso` de extra de Arch (`arch=any`) y corre el build entero de forma nativa en `ubuntu-24.04-arm`. En un host x86_64 el mismo contenedor usa qemu-user.
+
+## ISOs en GitHub Actions
+
+Los workflows `iso-x86_64.yml` e `iso-arm64.yml` no corren en cada pull request ni en cada push: una ISO arm64 tarda del orden de una hora. No forman parte de los checks obligatorios del repositorio.
+
+Se disparan a mano (**Actions → el workflow → Run workflow**) o cada noche sobre `main` (`schedule`, 04:17 UTC la x86_64 y 04:47 UTC la arm64). El disparo manual pide la ref (rama, tag o SHA; vacío = la rama desde la que se lanza) y la edición (`niri` por defecto; en arm64 solo existe `niri`). Una corrida nueva de la misma ref cancela la anterior.
+
+Al terminar, la corrida deja artefactos con retención de 7 días:
+
+- la ISO
+- `SHA256SUMS`
+- en arm64, la salida de `file` sobre los binarios Rust (`churros-*`), Calamares, Bazaar, yay, wlogout y libdex
+- en x86_64, `scripts/qa/runs/<id>/` del smoke (`report.md`, capturas y logs)
+- en arm64, el log de la consola serie si QEMU pudo arrancar la ISO
+
+El resumen del job incluye el commit, el nombre de la ISO, el tamaño y el sha256. Para bajar un artefacto: la página de la corrida en Actions, o `gh run download` con el id de esa corrida. El schedule solo hace efecto cuando el workflow ya está en `main`.

@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""qa: helpers para manejar la VM de una corrida (RUN_ID por --run, QA_RUN o runs/latest).
+
+  qa key COMBO...  [--until-*]    teclas por QMP: mod+spc, mod+shift+slash, ctrl+alt+f2, esc, ret
+  qa type TEXTO    [--until-*]    escribe texto por QMP
+  qa cmd 'SHELL'   [--user] [--timeout N] [--until-*]   comando en el invitado (root, o usuario live
+                                  con el entorno Wayland/NIRI_SOCKET); imprime salida, sale con su rc
+  qa shot NOMBRE   [--grim]       captura (QMP; --grim = dentro de la sesión)
+  qa wait  --until-serial REGEX | --until-cmd 'SHELL' [--user] | --timeout N
+  qa serial 'TEXTO'               escribe en la consola serie (añade \\r)
+  qa status                       estado de Noctalia (noctalia msg status)
+
+--until-serial REGEX  espera ese patrón en la consola serie (desde la acción)
+--until-cmd 'SHELL'   repite el comando en el invitado hasta rc=0 (--until-user lo corre como usuario)
+--timeout N           límite de la espera (defecto 60 s); sin condición, es una espera fija explícita."""
+import argparse, os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import qalib  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="qa", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--run")
+    ap.add_argument("action", choices=["key", "type", "cmd", "shot", "wait", "serial", "status"])
+    ap.add_argument("args", nargs="*")
+    ap.add_argument("--user", action="store_true")
+    ap.add_argument("--grim", action="store_true")
+    ap.add_argument("--until-serial"); ap.add_argument("--until-cmd"); ap.add_argument("--until-user", action="store_true")
+    ap.add_argument("--timeout", type=float, default=None); ap.add_argument("--interval", type=float, default=1.5)
+    a = ap.parse_args()
+    rid = qalib.resolve_run(a.run)
+    off = qalib.serial_size(rid)
+    rc = 0
+    if a.action == "key":
+        for c in a.args:
+            qalib.send_combo(rid, c)
+    elif a.action == "type":
+        qalib.type_text(rid, " ".join(a.args))
+    elif a.action == "serial":
+        qalib.serial_send(rid, " ".join(a.args) + "\r")
+    elif a.action == "cmd":
+        rc, out = qalib.guest_cmd(rid, " ".join(a.args), user=a.user, timeout=int(a.timeout or 120))
+        sys.stdout.write(out)
+        if not (a.until_serial or a.until_cmd):
+            return rc
+    elif a.action == "shot":
+        from checks.common import Ctx
+        p = Ctx(rid).shot(a.args[0], prefer="grim" if a.grim else None)
+        print(p)
+        return 0 if p else 1
+    elif a.action == "status":
+        from checks.common import Ctx
+        print(Ctx(rid).noctalia_status()); return 0
+    if a.action == "wait" or a.until_serial or a.until_cmd:
+        tmo = a.timeout if a.timeout is not None else 60
+        ok, detail = qalib.wait_until(rid, serial=a.until_serial, cmd=a.until_cmd,
+                                      user=a.until_user or (a.action == "wait" and a.user),
+                                      timeout=tmo, interval=a.interval, since=off)
+        print(("OK " if ok else "TIMEOUT ") + (detail or "")[-300:], file=sys.stderr)
+        return 0 if ok else 1
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

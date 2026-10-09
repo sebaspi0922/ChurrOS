@@ -4,6 +4,7 @@
 *.log
 *.tmp
 .cache/
+.ci-cache/
 work/
 out/
 build/

@@ -31,9 +31,27 @@ else
 fi
 CHURROS_CONTAINERFILE="${CHURROS_CONTAINERFILE:-$CHURROS_REPO_ROOT/Containerfile}"
 CHURROS_CONTAINER_PLATFORM="${CHURROS_CONTAINER_PLATFORM:-}"
-CHURROS_CONTAINER_HOME_VOL="${CHURROS_CONTAINER_HOME_VOL:-churros-builder-home}"
-CHURROS_CONTAINER_CACHE_VOL="${CHURROS_CONTAINER_CACHE_VOL:-churros-pacman-cache}"
-CHURROS_CONTAINER_CARGO_DIR="${CHURROS_CONTAINER_CARGO_DIR:-/churros/rust/target/container}"
+# Un valor ya exportado (por ejemplo un directorio absoluto, que docker monta
+# con bind) no se sustituye. El CI de las ISO apunta aquí para poder guardar
+# la caché con actions/cache. Si no viene nada, quedan los volúmenes de siempre.
+if [ -n "${CHURROS_CONTAINER_HOME_VOL:-}" ]; then
+    CHURROS_CONTAINER_HOME_VOL_EXPLICIT=1
+else
+    CHURROS_CONTAINER_HOME_VOL_EXPLICIT=0
+    CHURROS_CONTAINER_HOME_VOL=churros-builder-home
+fi
+if [ -n "${CHURROS_CONTAINER_CACHE_VOL:-}" ]; then
+    CHURROS_CONTAINER_CACHE_VOL_EXPLICIT=1
+else
+    CHURROS_CONTAINER_CACHE_VOL_EXPLICIT=0
+    CHURROS_CONTAINER_CACHE_VOL=churros-pacman-cache
+fi
+if [ -n "${CHURROS_CONTAINER_CARGO_DIR:-}" ]; then
+    CHURROS_CONTAINER_CARGO_DIR_EXPLICIT=1
+else
+    CHURROS_CONTAINER_CARGO_DIR_EXPLICIT=0
+    CHURROS_CONTAINER_CARGO_DIR=/churros/rust/target/container
+fi
 # Arch es rolling: una imagen de más de una semana obliga a cada build a
 # actualizar medio sistema con pacman -Syu antes de empezar.
 CHURROS_CONTAINER_MAX_AGE=$((7 * 24 * 3600))
@@ -61,9 +79,15 @@ container_use_arch() {
             CHURROS_CONTAINER_BASE="${CHURROS_CONTAINER_BASE:-docker.io/menci/archlinuxarm:latest}"
             CHURROS_CONTAINERFILE="$CHURROS_REPO_ROOT/Containerfile.aarch64"
             CHURROS_CONTAINER_PLATFORM=linux/arm64
-            CHURROS_CONTAINER_HOME_VOL=churros-builder-home-aarch64
-            CHURROS_CONTAINER_CACHE_VOL=churros-pacman-cache-aarch64
-            CHURROS_CONTAINER_CARGO_DIR=/churros/rust/target/container-aarch64
+            if [ "$CHURROS_CONTAINER_HOME_VOL_EXPLICIT" -eq 0 ]; then
+                CHURROS_CONTAINER_HOME_VOL=churros-builder-home-aarch64
+            fi
+            if [ "$CHURROS_CONTAINER_CACHE_VOL_EXPLICIT" -eq 0 ]; then
+                CHURROS_CONTAINER_CACHE_VOL=churros-pacman-cache-aarch64
+            fi
+            if [ "$CHURROS_CONTAINER_CARGO_DIR_EXPLICIT" -eq 0 ]; then
+                CHURROS_CONTAINER_CARGO_DIR=/churros/rust/target/container-aarch64
+            fi
             ;;
         x86_64) ;;
         *) container_die "container_use_arch: arquitectura no soportada '$1'" ;;
