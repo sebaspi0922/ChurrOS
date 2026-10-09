@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""vm-up RUN_ID [--down]: arranca (o reutiliza) la VM y el servidor HTTP de una
+corrida. Idempotente: si QEMU ya responde por QMP y el servidor vive, no hace
+nada. Cada corrida tiene sus propios sockets (vm/qmp.sock, vm/serial.sock),
+log serie (vm/serial.log), disco qcow2 y variables EFI."""
+import os, socket, subprocess, sys, time
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib"))
+import qalib  # noqa: E402
+
+OVMF_CODE = ["/usr/share/OVMF/OVMF_CODE_4M.fd", "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+             "/usr/share/edk2-ovmf/x64/OVMF_CODE.4m.fd", "/usr/share/OVMF/OVMF_CODE.fd"]
+OVMF_VARS = ["/usr/share/OVMF/OVMF_VARS_4M.fd", "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+             "/usr/share/edk2-ovmf/x64/OVMF_VARS.4m.fd", "/usr/share/OVMF/OVMF_VARS.fd"]
+
+
+def first(paths):
+    return next((p for p in paths if os.path.exists(p)), None)
+
+
+def free_port(pref=None):
+    for port in ([pref] if pref else []) + list(range(18080, 18200)):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", port)); s.close(); return port
+        except OSError:
+            s.close()
+    raise SystemExit("sin puertos libres")
+
+
+def srv_up(run_id, st):
+    rd = qalib.run_dir(run_id)
+    pid = st.get("srv_pid")
+    if pid and qalib.pid_alive(pid):
+        return st["http_port"]
+    port = free_port(st.get("http_port"))
+    log = open(os.path.join(rd, "logs", "srv.log"), "a")
+    p = subprocess.Popen([sys.executable, os.path.join(qalib.QA_DIR, "lib", "srv.py"), rd,
+                          os.path.join(qalib.QA_DIR, "guest"), str(port)],
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    qalib.update_state(run_id, lambda s: s.update({"srv_pid": p.pid, "http_port": port}))
+    time.sleep(0.5)
+    print(f"servidor HTTP en 127.0.0.1:{port} (pid {p.pid}); el invitado lo ve en 10.0.2.2:{port}")
+    return port
+
+
+def display_for(st):
+    """Dispositivo y display por defecto. 3D y KVM van por separado: virtio-vga-gl
+    solo si el host tiene /dev/dri; si no, virtio-gpu y el smoke anida Niri en cage.
+    QA_DISPLAY, si está, pisa el display (no el dispositivo)."""
+    if st.get("has_3d"):
+        return ["-device", "virtio-vga-gl,id=vgpu"], "egl-headless,gl=on"
+    return ["-device", "virtio-gpu,id=vgpu"], "none"
+
+
+def qemu_up(run_id, st):
+    rd = qalib.run_dir(run_id); vm = os.path.join(rd, "vm"); os.makedirs(vm, exist_ok=True)
+    pid = st.get("qemu_pid")
+    if pid and qalib.pid_alive(pid) and qalib.qmp_alive(run_id):
+        print(f"VM ya arrancada (pid {pid}, estado {qalib.qmp_alive(run_id)})")
+        return pid
+    if pid and qalib.pid_alive(pid):
+        qalib.kill_pid(pid); time.sleep(2)
+    iso = st.get("iso")
+    if not iso or not os.path.exists(iso):
+        raise SystemExit(f"no hay ISO para esta corrida ({iso})")
+    code, vars_src = first(OVMF_CODE), first(OVMF_VARS)
+    if not code or not vars_src:
+        raise SystemExit("OVMF no encontrado (apt install ovmf)")
+    disk, evars = os.path.join(vm, "disk.qcow2"), os.path.join(vm, "OVMF_VARS.fd")
+    if not os.path.exists(disk):
+        subprocess.run(["qemu-img", "create", "-q", "-f", "qcow2", disk, "64G"], check=True)
+    if not os.path.exists(evars):
+        subprocess.run(["cp", vars_src, evars], check=True)
+    slog = os.path.join(vm, "serial.log")
+    if os.path.exists(slog) and os.path.getsize(slog):  # VM nueva: log serie nuevo
+        n = 1
+        while os.path.exists(f"{slog}.{n}"):
+            n += 1
+        os.rename(slog, f"{slog}.{n}")
+    for s in ("qmp.sock", "serial.sock"):
+        if os.path.exists(os.path.join(vm, s)):
+            os.remove(os.path.join(vm, s))
+    kvm = st.get("accel") == "kvm"
+    has_3d = bool(st.get("has_3d"))
+    gpu, default_display = display_for(st)
+    display = os.environ.get("QA_DISPLAY", default_display)
+    args = ["qemu-system-x86_64", "-name", f"churros-verify-{run_id}",
+            "-machine", "q35" + (",accel=kvm" if kvm else ""), *(["-cpu", "host"] if kvm else []),
+            "-smp", "4" if kvm else "2", "-m", os.environ.get("QA_MEM", "4096"),
+            *gpu, "-display", display,
+            "-device", "qemu-xhci", "-device", "usb-tablet",
+            "-audiodev", "none,id=snd0", "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0",
+            "-nic", "user,model=virtio-net-pci",
+            "-drive", f"if=pflash,format=raw,readonly=on,file={code}",
+            "-drive", f"if=pflash,format=raw,file={evars}",
+            "-drive", f"file={disk},format=qcow2,if=virtio",
+            "-cdrom", iso, "-boot", "order=d",
+            "-chardev", f"socket,id=ser0,path={vm}/serial.sock,server=on,wait=off,logfile={vm}/serial.log,logappend=on",
+            "-serial", "chardev:ser0",
+            "-qmp", f"unix:{vm}/qmp.sock,server=on,wait=off",
+            "-pidfile", f"{vm}/qemu.pid"]
+    log = open(os.path.join(rd, "logs", "qemu.log"), "a")
+    log.write(" ".join(args) + "\n"); log.flush()
+    p = subprocess.Popen(args, stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(50):
+        if qalib.qmp_alive(run_id):
+            break
+        if p.poll() is not None:
+            raise SystemExit(f"QEMU salió con rc={p.returncode}; ver logs/qemu.log")
+        time.sleep(0.2)
+    qalib.update_state(run_id, lambda s: s.update({"qemu_pid": p.pid, "session": None, "mod_key": "meta_l"}))
+    accel = "KVM" if kvm else "TCG"
+    gpu_note = "3D" if has_3d else "sin 3D"
+    print(f"VM arrancada (pid {p.pid}, {accel} {gpu_note}, display={display})")
+    return p.pid
+
+
+def down(run_id):
+    st = qalib.load_state(run_id)
+    if st.get("qemu_pid") and qalib.pid_alive(st["qemu_pid"]):
+        try:
+            q = qalib.QMP(run_id); q.cmd({"execute": "quit"}); q.close()
+        except Exception:
+            qalib.kill_pid(st["qemu_pid"])
+    if st.get("srv_pid"):
+        qalib.kill_pid(st["srv_pid"])
+    print("VM y servidor parados")
+
+
+if __name__ == "__main__":
+    rid = qalib.resolve_run(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None)
+    os.makedirs(os.path.join(qalib.run_dir(rid), "logs"), exist_ok=True)
+    if "--down" in sys.argv:
+        down(rid); sys.exit(0)
+    st = qalib.load_state(rid)
+    srv_up(rid, st)
+    qemu_up(rid, qalib.load_state(rid))

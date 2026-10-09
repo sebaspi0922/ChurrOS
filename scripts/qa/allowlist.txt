@@ -1,0 +1,23 @@
+# Errores conocidos e inofensivos en la VM (una regex de Python por línea).
+# Prefijos: `unit:` para `systemctl --failed`, `noctalia:` para noctalia.log,
+# sin prefijo para `journalctl -p err`. Las líneas con # son comentarios.
+# Añade aquí solo ruido de la VM; un error real del producto no va aquí.
+
+# Kernel/firmware de QEMU
+virt/tdx: TDX not supported by the host platform
+# Presets de systemd en el live (conocido, upstream de archiso)
+Failed to preset all unit: Unit dbus-org\.freedesktop\.ModemManager1\.service is an unresolvable alias
+Failed to preset all unit: Unit /etc/systemd/system/getty@tty1\.service is masked
+# Sin 3D en la VM: la sesión real de Niri no consigue renderer (por eso se anida en cage)
+niri.*(DeviceMissing|no allocator available|Failed to open device|software EGL)
+
+# noctalia.log: la VM no tiene BlueZ, sensores ni red a api.noctalia.dev
+noctalia:\[bluetooth\]
+noctalia:\[sysmon\].*temperature
+noctalia:\[http\] download failed url=https://api\.noctalia\.dev
+noctalia:\[community_palettes\]
+noctalia:\[secret-store\]
+noctalia:\[wireplumber\]
+
+# Ruido del propio harness: intentos de login por la consola serie
+agetty\[\d+\]: checkname failed

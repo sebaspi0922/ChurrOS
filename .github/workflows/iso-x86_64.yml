@@ -1,10 +1,8 @@
-name: ISO ARM64
+name: ISO x86_64
 
-# ISO aarch64 en un runner ARM nativo, con Containerfile.aarch64 (sin
-# qemu-user). No corre en pull_request ni en push: el build tarda alrededor
-# de una hora y no es un check obligatorio. Se dispara a mano (ref y edición;
-# solo niri) y cada noche sobre main. Una corrida nueva de la misma ref
-# cancela la anterior.
+# ISO x86_64. No corre en pull_request ni en push: el build es lento y no
+# es un check obligatorio. Se dispara a mano (ref y edición) y cada noche
+# sobre main. Una corrida nueva de la misma ref cancela la anterior.
 
 on:
   workflow_dispatch:
@@ -15,7 +13,7 @@ on:
         default: ""
         type: string
       edition:
-        description: Edición (aarch64 solo tiene niri)
+        description: Edición
         required: true
         default: niri
         type: choice
@@ -25,20 +23,20 @@ on:
           - kde
           - server
   schedule:
-    - cron: "47 4 * * *"
+    - cron: "17 4 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: iso-arm64-${{ github.event.inputs.ref || github.ref_name }}
+  group: iso-x86_64-${{ github.event.inputs.ref || github.ref_name }}
   cancel-in-progress: true
 
 jobs:
   iso:
-    name: Build aarch64 ISO
+    name: Build x86_64 ISO
     if: github.event_name != 'schedule' || github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     outputs:
       sha: ${{ steps.meta.outputs.sha }}
@@ -61,7 +59,6 @@ jobs:
         env:
           INPUT_REF: ${{ github.event.inputs.ref }}
           INPUT_EDITION: ${{ github.event.inputs.edition }}
-          CHURROS_ISO_ARCH: aarch64
         run: bash _workflow/scripts/ci/resolve-build.sh
 
       - name: Checkout del código a construir
@@ -76,24 +73,24 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: src/.ci-cache/pacman
-          key: iso-arm-pacman-${{ hashFiles('src/archiso/packages.aarch64', 'src/archiso/pacman.aarch64.conf', 'src/Containerfile.aarch64') }}
-          restore-keys: iso-arm-pacman-
+          key: iso-x86-pacman-${{ hashFiles('src/archiso/packages.x86_64', 'src/archiso/pacman.x86_64.conf', 'src/Containerfile') }}
+          restore-keys: iso-x86-pacman-
 
       - name: Caché de cargo (registro)
         id: cache-cargo-home
         uses: actions/cache/restore@v4
         with:
           path: src/.ci-cache/home
-          key: iso-arm-cargo-home-${{ hashFiles('src/rust/Cargo.lock', 'src/Containerfile.aarch64') }}
-          restore-keys: iso-arm-cargo-home-
+          key: iso-x86-cargo-home-${{ hashFiles('src/rust/Cargo.lock', 'src/Containerfile') }}
+          restore-keys: iso-x86-cargo-home-
 
       - name: Caché de cargo (target)
         id: cache-cargo-target
         uses: actions/cache/restore@v4
         with:
-          path: src/rust/target/container-aarch64
-          key: iso-arm-cargo-target-${{ hashFiles('src/rust/Cargo.lock', 'src/Containerfile.aarch64') }}
-          restore-keys: iso-arm-cargo-target-
+          path: src/rust/target/container
+          key: iso-x86-cargo-target-${{ hashFiles('src/rust/Cargo.lock', 'src/Containerfile') }}
+          restore-keys: iso-x86-cargo-target-
 
       - name: Build ISO
         working-directory: src
@@ -104,7 +101,7 @@ jobs:
           EDITION: ${{ steps.spec.outputs.edition }}
         run: |
           mkdir -p "$CHURROS_CONTAINER_CACHE_VOL" "$CHURROS_CONTAINER_HOME_VOL"
-          ./churros build --container --arch arm64 --edition "$EDITION"
+          ./churros build --container --edition "$EDITION"
 
       - name: Permisos de la caché
         if: always()
@@ -131,7 +128,7 @@ jobs:
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: src/rust/target/container-aarch64
+          path: src/rust/target/container
           key: ${{ steps.cache-cargo-target.outputs.cache-primary-key }}
 
       - name: Metadatos de la ISO
@@ -139,7 +136,7 @@ jobs:
         working-directory: src
         env:
           BUILD_EDITION: ${{ steps.spec.outputs.edition }}
-          BUILD_ARCH: aarch64
+          BUILD_ARCH: x86_64
           BUILD_REF_NAME: ${{ steps.spec.outputs.ref }}
         run: bash "$GITHUB_WORKSPACE/_workflow/scripts/ci/record-iso-meta.sh" out
 
@@ -148,16 +145,8 @@ jobs:
         env:
           BUILD_COMMIT: ${{ steps.meta.outputs.sha }}
           BUILD_EDITION: ${{ steps.meta.outputs.edition }}
-          BUILD_ARCH: aarch64
+          BUILD_ARCH: x86_64
         run: bash "$GITHUB_WORKSPACE/_workflow/scripts/ci/iso-summarize.sh" out
-
-      - name: file sobre los binarios
-        env:
-          ISO_NAME: ${{ steps.meta.outputs.iso_name }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends xorriso squashfs-tools libarchive-tools file
-          bash _workflow/scripts/ci/iso-elf-report.sh "src/out/${ISO_NAME}" src/elf-report.txt
 
       - name: Subir ISO
         if: always()
@@ -178,26 +167,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Subir informe file
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.meta.outputs.artifact }}-elf
-          path: src/elf-report.txt
-          if-no-files-found: warn
-          retention-days: 7
-
-  serial-smoke:
-    name: Serial smoke aarch64
+  smoke:
+    name: Smoke x86_64
     needs: iso
     if: always() && needs.iso.outputs.sha != ''
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Liberar disco
         run: bash scripts/ci/free-runner-disk.sh
@@ -205,43 +185,40 @@ jobs:
       - name: Habilitar KVM
         run: bash scripts/ci/enable-kvm.sh
 
+      - name: Paquetes del humo
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf imagemagick curl shellcheck gettext zstd
+
       - name: Bajar la ISO
         uses: actions/download-artifact@v4
         with:
           name: ${{ needs.iso.outputs.artifact }}-iso
           path: iso
 
-      - name: QEMU
-        id: qemu
-        run: |
-          if ! sudo apt-get update || ! sudo apt-get install -y --no-install-recommends qemu-system-arm qemu-efi-aarch64 qemu-utils; then
-            echo "skip=apt" >> "$GITHUB_OUTPUT"
-            {
-              echo "### Humo serie arm64"
-              echo ""
-              echo "Omitido: no se pudo instalar QEMU en el runner."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+      - name: Bajar SHA256SUMS
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.iso.outputs.artifact }}-sha256
+          path: iso
 
-      - name: Humo por consola serie
-        if: steps.qemu.outputs.skip != 'apt'
+      - name: churros-verify smoke
         env:
+          BUILD_SHA: ${{ needs.iso.outputs.sha }}
+          BUILD_REF: ${{ needs.iso.outputs.ref }}
+          EDITION: ${{ needs.iso.outputs.edition }}
           ISO_NAME: ${{ needs.iso.outputs.iso_name }}
-        run: |
-          set +e
-          python3 scripts/ci/arm64-serial-smoke.py "iso/${ISO_NAME}" serial-smoke
-          rc=$?
-          set -e
-          if [ "$rc" -eq 2 ]; then
-            exit 0
-          fi
-          exit "$rc"
+        run: bash scripts/ci/run-x86-smoke.sh
 
-      - name: Subir log de la serie
+      - name: Quitar el disco de la VM
+        if: always()
+        run: |
+          rm -f scripts/qa/runs/latest
+          find scripts/qa/runs -name disk.qcow2 -delete 2>/dev/null || true
+
+      - name: Subir runs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ needs.iso.outputs.artifact }}-serial
-          path: serial-smoke/
+          name: ${{ needs.iso.outputs.artifact }}-smoke
+          path: scripts/qa/runs/
           if-no-files-found: ignore
           retention-days: 7

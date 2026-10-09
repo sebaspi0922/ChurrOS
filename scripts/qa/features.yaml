@@ -1,0 +1,107 @@
+# qa-diffmap: rutas cambiadas (git diff BASE...SHA) -> pruebas profundas.
+# Globs relativos a la raíz del repo: `*` no cruza `/`, `**` sí.
+# `editions` limita la feature a esas ediciones; en otra edición sale como SKIP
+# con la indicación de qué corrida hace falta. Lo que no case con ninguna
+# feature ni con `docs_only` sale como UNMAPPED en el informe.
+# Checks disponibles: ver `churros-verify checks`.
+
+docs_only:
+  - "docs/**"
+  - "*.md"
+  - "**/*.md"
+  - "po/**"
+  - "LICENSE"
+  - "MAINTAINERS"
+  - ".github/ISSUE_TEMPLATE/**"
+
+features:
+  - id: niri-config
+    title: "Configuración de Niri (atajos, autostart, overlay)"
+    editions: [niri]
+    paths:
+      - "archiso/airootfs/etc/skel/.config/niri/**"
+      - "archiso/airootfs/usr/share/churros/defaults/niri/**"
+    checks: [niri-config-valid, niri-autostart-clean, niri-spawn-binds, niri-hotkey-overlay]
+
+  - id: noctalia
+    title: "Noctalia (config, paleta, tema claro/oscuro)"
+    editions: [niri]
+    paths:
+      - "archiso/airootfs/etc/skel/.config/noctalia/**"
+      - "archiso/airootfs/usr/share/churros/defaults/noctalia/**"
+      - "rust/services/src/noctalia.rs"
+    checks: [noctalia-config-valid, noctalia-theme-light-dark, noctalia-log-errors]
+
+  - id: wallpaper
+    title: "Fondo de pantalla (churros-apply-wallpaper, wallpapers)"
+    editions: [niri]
+    paths:
+      - "archiso/airootfs/usr/bin/churros-apply-wallpaper"
+      - "archiso/airootfs/usr/share/churros/wallpapers/**"
+      - "rust/preferences/src/services/wallpaper.rs"
+    checks: [wallpaper-apply-noctalia]
+
+  - id: wallpaper-other-editions
+    title: "Fondo en KDE/XFCE (script compartido)"
+    editions: [kde, xfce]
+    paths:
+      - "archiso/airootfs/usr/bin/churros-apply-wallpaper"
+    checks: [edition-wallpaper]
+
+  - id: preferences
+    title: "Ajustes (rust/preferences)"
+    paths:
+      - "rust/preferences/**"
+      - "rust/services/**"
+    checks: [host-check, preferences-launch]
+
+  - id: packages
+    title: "Lista de paquetes de la ISO"
+    paths:
+      - "archiso/packages.x86_64"
+      - "archiso/packages.aarch64"
+      - "archiso/packages.*.x86_64"
+    checks: [packages-installed]
+
+  - id: greetd
+    title: "Login (greetd)"
+    paths:
+      - "archiso/airootfs/etc/greetd/**"
+    checks: [greetd-config]
+
+  - id: kde
+    title: "Edición KDE"
+    editions: [kde]
+    paths:
+      - "archiso/packages.kde.*"
+      - "archiso/airootfs/etc/xdg/kdeglobals"
+      - "archiso/airootfs/etc/xdg/autostart/churros-kde-*"
+      - "archiso/airootfs/etc/xdg/xdg-desktop-portal/kde-portals.conf"
+    checks: [edition-session]
+
+  - id: xfce
+    title: "Edición XFCE"
+    editions: [xfce]
+    paths:
+      - "archiso/packages.xfce.*"
+      - "archiso/airootfs/etc/skel/.config/xfce4/**"
+      - "archiso/airootfs/usr/bin/churros-xfce-session"
+    checks: [edition-session]
+
+  - id: build-tooling
+    title: "CLI y build (./churros, scripts)"
+    paths:
+      - "churros"
+      - "scripts/cli/**"
+      - "scripts/lib/**"
+      - "scripts/*.sh"
+      - "scripts/*.py"
+      - "scripts/*.js"
+      - "Containerfile"
+    checks: [host-check]
+
+  - id: qa-tooling
+    title: "La propia herramienta de QA"
+    paths:
+      - "scripts/qa/**"
+    checks: [host-check]
